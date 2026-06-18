@@ -2,6 +2,8 @@ import argparse
 import sys
 import json
 import os
+import asyncio
+import time
 from typing import Optional
 from . import __version__
 from .parser import LogParser
@@ -43,6 +45,152 @@ class CLI:
 
         subparsers = parser.add_subparsers(dest="command", required=True)
 
+        # ===== serve 命令：启动实时守护进程 =====
+        serve_parser = subparsers.add_parser(
+            "serve",
+            help="启动实时监听服务（守护进程），接收日志流并维护滑动窗口因果模型",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
+示例:
+  %(prog)s serve --host 0.0.0.0 --port 8765 --window-seconds 300
+  %(prog)s serve -p 8765 -w 600 --sample-interval 3
+            """,
+        )
+        serve_parser.add_argument(
+            "-H", "--host",
+            type=str,
+            default="127.0.0.1",
+            help="服务监听地址（默认 127.0.0.1）",
+        )
+        serve_parser.add_argument(
+            "-p", "--port",
+            type=int,
+            default=8765,
+            help="服务监听端口（默认 8765）",
+        )
+        serve_parser.add_argument(
+            "-w", "--window-seconds",
+            type=int,
+            default=300,
+            help="滑动时间窗口大小，单位秒（默认 300 = 5分钟）",
+        )
+        serve_parser.add_argument(
+            "--sample-interval",
+            type=float,
+            default=5.0,
+            help="异常检测的采样间隔，单位秒（默认 5.0）",
+        )
+        serve_parser.add_argument(
+            "--min-support",
+            type=int,
+            default=2,
+            help="置信度计算的最小支持度（默认 2）",
+        )
+        serve_parser.add_argument(
+            "--alert-file",
+            type=str,
+            default=None,
+            help="告警写入的文件路径（默认仅打印到终端）",
+        )
+
+        # ===== rt-query 命令：实时查询 =====
+        rt_query_parser = subparsers.add_parser(
+            "rt-query",
+            help="向运行中的实时服务查询当前窗口内的因果置信度",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
+示例:
+  %(prog)s rt-query --cause "db_query: SELECT * FROM users" --effect "http_call: 500"
+  %(prog)s rt-query --server localhost:8765 --cause X --effect Y --json
+            """,
+        )
+        rt_query_parser.add_argument(
+            "-s", "--server",
+            type=str,
+            default="http://localhost:8765",
+            help="实时服务地址（默认 http://localhost:8765）",
+        )
+        rt_query_parser.add_argument(
+            "--cause",
+            type=str,
+            required=True,
+            help="原因事件，格式: 'event_type: message'",
+        )
+        rt_query_parser.add_argument(
+            "--effect",
+            type=str,
+            required=True,
+            help="结果事件，格式: 'event_type: message'",
+        )
+        rt_query_parser.add_argument(
+            "--json",
+            action="store_true",
+            default=False,
+            help="以 JSON 格式输出结果",
+        )
+        rt_query_parser.add_argument(
+            "-v", "--verbose",
+            action="store_true",
+            default=False,
+            help="输出详细信息",
+        )
+
+        # ===== watch 命令：监听告警 =====
+        watch_parser = subparsers.add_parser(
+            "watch",
+            help="监听实时服务的告警推送，支持注册监控的因果对",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
+示例:
+  %(prog)s watch --cause "db_query: SELECT * FROM users" --effect "http_call: 500"
+  %(prog)s watch --server ws://localhost:8765 --list
+  %(prog)s watch --cause X --effect Y --add --output alerts.log
+            """,
+        )
+        watch_parser.add_argument(
+            "-s", "--server",
+            type=str,
+            default="ws://localhost:8765",
+            help="实时服务地址（默认 ws://localhost:8765）",
+        )
+        watch_parser.add_argument(
+            "--cause",
+            type=str,
+            default=None,
+            help="要监控的原因事件",
+        )
+        watch_parser.add_argument(
+            "--effect",
+            type=str,
+            default=None,
+            help="要监控的结果事件",
+        )
+        watch_parser.add_argument(
+            "--add",
+            action="store_true",
+            default=False,
+            help="注册监控（连接后发送 watch 命令）",
+        )
+        watch_parser.add_argument(
+            "--remove",
+            action="store_true",
+            default=False,
+            help="取消监控",
+        )
+        watch_parser.add_argument(
+            "--list",
+            action="store_true",
+            default=False,
+            help="仅列出当前监控的因果对，不持续监听",
+        )
+        watch_parser.add_argument(
+            "-o", "--output",
+            type=str,
+            default=None,
+            help="告警写入的文件路径",
+        )
+
+        # ===== analyze 命令 =====
         analyze_parser = subparsers.add_parser(
             "analyze",
             help="分析因果关系：推断 cause 事件是否导致 effect 事件",
@@ -146,6 +294,12 @@ class CLI:
 
         if args.command == "analyze":
             return self._cmd_analyze(args)
+        elif args.command == "serve":
+            return self._cmd_serve(args)
+        elif args.command == "rt-query":
+            return self._cmd_rt_query(args)
+        elif args.command == "watch":
+            return self._cmd_watch(args)
 
         self.parser.print_help()
         return 1
@@ -364,6 +518,264 @@ class CLI:
                 print(f"  平均时间间隔:        {result.avg_time_interval_ms} ms")
                 print(f"  时间间隔标准差:      ±{result.std_time_interval_ms} ms")
             print()
+
+
+    def _cmd_serve(self, args) -> int:
+        import uvicorn
+        from .anomaly_detection import AnomalyAlert
+
+        os.environ["CAUSAL_WINDOW_SECONDS"] = str(args.window_seconds)
+        os.environ["CAUSAL_MIN_SUPPORT"] = str(args.min_support)
+        os.environ["CAUSAL_SAMPLE_INTERVAL"] = str(args.sample_interval)
+
+        alert_file = args.alert_file
+        alert_fh = None
+
+        def alert_handler(alert: AnomalyAlert):
+            if alert_file:
+                nonlocal alert_fh
+                if alert_fh is None:
+                    try:
+                        alert_fh = open(alert_file, "a", encoding="utf-8")
+                    except Exception as e:
+                        print(f"[serve] 无法打开告警文件 {alert_file}: {e}", file=sys.stderr)
+                        return
+                try:
+                    alert_fh.write(json.dumps({
+                        "alert_id": alert.alert_id,
+                        "timestamp": alert.timestamp,
+                        "cause": alert.cause,
+                        "effect": alert.effect,
+                        "old_score": alert.old_score,
+                        "new_score": alert.new_score,
+                        "change_magnitude": alert.change_magnitude,
+                        "alert_type": alert.alert_type,
+                        "message": alert.message,
+                    }, ensure_ascii=False) + "\n")
+                    alert_fh.flush()
+                except Exception as e:
+                    print(f"[serve] 写入告警文件失败: {e}", file=sys.stderr)
+
+        try:
+            from . import realtime_server
+            realtime_server._alert_file_handler = alert_handler
+        except Exception as e:
+            print(f"[serve] 初始化告警处理器失败: {e}", file=sys.stderr)
+
+        print("=" * 70)
+        print("[实时模式] 启动因果日志分析实时服务")
+        print("=" * 70)
+        print(f"  监听地址:     {args.host}:{args.port}")
+        print(f"  滑动窗口:     {args.window_seconds} 秒 ({args.window_seconds/60:.1f} 分钟)")
+        print(f"  采样间隔:     {args.sample_interval} 秒")
+        print(f"  最小支持度:   {args.min_support}")
+        if alert_file:
+            print(f"  告警文件:     {alert_file}")
+        print()
+        print("  WebSocket 入口:")
+        print(f"    ws://{args.host}:{args.port}/ws/ingest   (接收日志流)")
+        print(f"    ws://{args.host}:{args.port}/ws/alerts   (告警推送)")
+        print("  HTTP API:")
+        print(f"    GET  http://{args.host}:{args.port}/api/health")
+        print(f"    GET  http://{args.host}:{args.port}/api/stats")
+        print(f"    POST http://{args.host}:{args.port}/api/query")
+        print(f"    GET  http://{args.host}:{args.port}/api/watch")
+        print(f"    GET  http://{args.host}:{args.port}/api/alerts")
+        print("=" * 70)
+        print("按 Ctrl+C 停止服务")
+        print()
+
+        try:
+            uvicorn.run(
+                "causal_analyzer.realtime_server:app",
+                host=args.host,
+                port=args.port,
+                log_level="info",
+                reload=False,
+            )
+        except KeyboardInterrupt:
+            print("\n[serve] 服务已停止", flush=True)
+        except Exception as e:
+            print(f"[serve] 服务运行失败: {e}", file=sys.stderr)
+            return 14
+        finally:
+            if alert_fh:
+                try:
+                    alert_fh.close()
+                except Exception:
+                    pass
+
+        return 0
+
+    def _cmd_rt_query(self, args) -> int:
+        import aiohttp
+
+        server = args.server.rstrip("/")
+        url = f"{server}/api/query"
+
+        async def do_query():
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json={
+                    "cause": args.cause,
+                    "effect": args.effect,
+                }) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        print(f"错误: 服务返回 {resp.status}: {text}", file=sys.stderr)
+                        return None
+                    return await resp.json()
+
+        try:
+            result = asyncio.run(do_query())
+        except Exception as e:
+            print(f"错误: 无法连接到实时服务 {server}: {e}", file=sys.stderr)
+            return 15
+
+        if result is None:
+            return 15
+
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print("=" * 70)
+            print(f"[实时查询] 服务: {server}")
+            self._print_result(result, args.verbose)
+
+        return 0
+
+    def _cmd_watch(self, args) -> int:
+        import aiohttp
+        import websockets
+
+        ws_server = args.server.rstrip("/").replace("http://", "ws://").replace("https://", "wss://")
+        http_server = args.server.rstrip("/").replace("ws://", "http://").replace("wss://", "https://")
+
+        if args.list:
+            async def do_list():
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f"{http_server}/api/watch") as resp:
+                        if resp.status != 200:
+                            print(f"错误: {resp.status}", file=sys.stderr)
+                            return None
+                        return await resp.json()
+            try:
+                data = asyncio.run(do_list())
+            except Exception as e:
+                print(f"错误: 无法连接到服务 {http_server}: {e}", file=sys.stderr)
+                return 15
+            if data:
+                print(f"当前监控 {data['count']} 个因果对:")
+                for i, p in enumerate(data["pairs"], 1):
+                    print(f"  #{i:2d}  {p['cause']}  →  {p['effect']}")
+            return 0
+
+        if args.add or args.remove:
+            if not args.cause or not args.effect:
+                print("错误: --add/--remove 需要同时指定 --cause 和 --effect", file=sys.stderr)
+                return 6
+
+            method = "POST" if args.add else "DELETE"
+            async def do_watch():
+                async with aiohttp.ClientSession() as session:
+                    async with session.request(method, f"{http_server}/api/watch", json={
+                        "cause": args.cause,
+                        "effect": args.effect,
+                    }) as resp:
+                        if resp.status != 200:
+                            print(f"错误: {resp.status}", file=sys.stderr)
+                            return None
+                        return await resp.json()
+
+            try:
+                result = asyncio.run(do_watch())
+            except Exception as e:
+                print(f"错误: 无法连接到服务 {http_server}: {e}", file=sys.stderr)
+                return 15
+            if result:
+                action = "已注册监控" if args.add else "已取消监控"
+                print(f"{action}: {result['cause']} → {result['effect']}")
+            return 0
+
+        if args.cause and args.effect:
+            async def do_register_and_watch():
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(f"{http_server}/api/watch", json={
+                            "cause": args.cause,
+                            "effect": args.effect,
+                        }) as resp:
+                            if resp.status != 200:
+                                print(f"警告: 注册监控失败: {resp.status}", file=sys.stderr)
+                except Exception as e:
+                    print(f"警告: 注册监控失败: {e}", file=sys.stderr)
+
+                output_fh = None
+                if args.output:
+                    try:
+                        output_fh = open(args.output, "a", encoding="utf-8")
+                    except Exception as e:
+                        print(f"警告: 无法打开输出文件 {args.output}: {e}", file=sys.stderr)
+
+                try:
+                    ws_url = f"{ws_server}/ws/alerts"
+                    async with websockets.connect(ws_url) as ws:
+                        print(f"[watch] 已连接到 {ws_url}，等待告警...")
+                        print(f"[watch] 监控: {args.cause} → {args.effect}")
+                        print("按 Ctrl+C 停止")
+                        print()
+
+                        watch_msg = json.dumps({
+                            "action": "watch",
+                            "cause": args.cause,
+                            "effect": args.effect,
+                        })
+                        await ws.send(watch_msg)
+
+                        while True:
+                            try:
+                                msg = await ws.recv()
+                                data = json.loads(msg)
+                                if data.get("type") == "alert":
+                                    alert = data["data"]
+                                    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(alert["timestamp"]))
+                                    level = "!!!" if alert["change_magnitude"] > 60 else "!"
+                                    print(f"[{ts}] {level} {alert['alert_type'].upper()} {level}")
+                                    print(f"  {alert['message']}")
+                                    print(f"  分数变化: {alert['old_score']:.1f}% → {alert['new_score']:.1f}% "
+                                          f"(Δ {alert['change_magnitude']:+.1f})")
+                                    print()
+
+                                    if output_fh:
+                                        try:
+                                            output_fh.write(json.dumps(alert, ensure_ascii=False) + "\n")
+                                            output_fh.flush()
+                                        except Exception:
+                                            pass
+                                elif data.get("type") == "watch_ack":
+                                    print(f"[watch] 确认监控: {data['cause']} → {data['effect']}")
+                                    print()
+                            except websockets.ConnectionClosed:
+                                print("[watch] 连接已断开", file=sys.stderr)
+                                break
+                finally:
+                    if output_fh:
+                        try:
+                            output_fh.close()
+                        except Exception:
+                            pass
+
+            try:
+                asyncio.run(do_register_and_watch())
+            except KeyboardInterrupt:
+                print("\n[watch] 已停止")
+            except Exception as e:
+                print(f"错误: 连接失败: {e}", file=sys.stderr)
+                return 15
+
+            return 0
+
+        print("错误: 请指定 --list, 或同时指定 --cause/--effect 进行监控", file=sys.stderr)
+        return 6
 
 
 def main():
