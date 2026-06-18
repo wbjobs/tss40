@@ -118,6 +118,27 @@ class CLI:
             help="输出详细的中间统计信息",
         )
 
+        analyze_parser.add_argument(
+            "-s", "--streaming",
+            action="store_true",
+            default=False,
+            help="启用流式处理模式（外部排序 + Count-Min Sketch，适合 10GB+ 海量日志）",
+        )
+
+        analyze_parser.add_argument(
+            "--chunk-size",
+            type=int,
+            default=50000,
+            help="流式模式下每个内存块的最大行数（默认 50000）",
+        )
+
+        analyze_parser.add_argument(
+            "--tmp-dir",
+            type=str,
+            default=None,
+            help="流式模式下临时文件目录（默认使用系统临时目录）",
+        )
+
         return parser
 
     def run(self, argv: Optional[list] = None) -> int:
@@ -130,6 +151,74 @@ class CLI:
         return 1
 
     def _cmd_analyze(self, args) -> int:
+        if args.streaming:
+            return self._cmd_analyze_streaming(args)
+        return self._cmd_analyze_in_memory(args)
+
+    def _cmd_analyze_streaming(self, args) -> int:
+        if args.list_pairs:
+            print("错误：--streaming 模式下仅支持指定 cause/effect 的定向分析，不支持 --list-pairs", file=sys.stderr)
+            return 11
+        if not args.cause or not args.effect:
+            print("错误：流式模式下必须同时指定 --cause 和 --effect", file=sys.stderr)
+            return 6
+
+        try:
+            from .streaming_engine import StreamingCausalEngine
+        except ImportError as e:
+            print(f"错误：加载流式引擎失败 - {e}", file=sys.stderr)
+            return 12
+
+        if args.verbose:
+            sys.stderr.write("[mode] 流式处理模式已启用：外部排序 + Count-Min Sketch + 子图构建\n")
+
+        try:
+            with StreamingCausalEngine(
+                cause=args.cause,
+                effect=args.effect,
+                min_support=args.min_support,
+                chunk_size_lines=args.chunk_size,
+                tmp_dir=args.tmp_dir,
+                verbose=args.verbose,
+            ) as engine:
+                engine.load(args.log_file)
+                result = engine.infer()
+        except FileNotFoundError:
+            print(f"错误：找不到日志文件 {args.log_file}", file=sys.stderr)
+            return 2
+        except MemoryError:
+            print("错误：内存不足，请增大 --chunk-size 或切换到流式模式 --streaming", file=sys.stderr)
+            return 13
+        except Exception as e:
+            print(f"错误：流式处理失败 - {e}", file=sys.stderr)
+            return 3
+
+        if args.json:
+            output = {
+                "mode": "streaming",
+                "cause": result.cause,
+                "effect": result.effect,
+                "confidence_score": result.confidence_score,
+                "co_occurrence_traces": result.co_occurrence_traces,
+                "total_traces": result.total_traces,
+                "avg_time_interval_ms": result.avg_time_interval_ms,
+                "std_time_interval_ms": result.std_time_interval_ms,
+                "cause_only_traces": result.cause_only_traces,
+                "effect_only_traces": result.effect_only_traces,
+                "support": result.support,
+                "confidence": result.confidence,
+                "lift": result.lift,
+                "explanation": result.explanation,
+            }
+            print(json.dumps(output, ensure_ascii=False, indent=2))
+        else:
+            print("=" * 70)
+            print("[处理模式: STREAMING (外部排序 + Count-Min Sketch + 子图)]")
+            self._print_result(result, args.verbose)
+
+        return 0
+
+    def _cmd_analyze_in_memory(self, args) -> int:
         try:
             entries = self._load_logs(args.log_file)
         except FileNotFoundError:
@@ -171,6 +260,7 @@ class CLI:
 
         if args.json:
             output = {
+                "mode": "in-memory",
                 "cause": result.cause,
                 "effect": result.effect,
                 "confidence_score": result.confidence_score,
@@ -187,6 +277,8 @@ class CLI:
             }
             print(json.dumps(output, ensure_ascii=False, indent=2))
         else:
+            print("=" * 70)
+            print("[处理模式: IN-MEMORY (完整因果图 + 精确计数)]")
             self._print_result(result, args.verbose)
 
         return 0
